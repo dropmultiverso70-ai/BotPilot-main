@@ -1,0 +1,59 @@
+name: Build Windows Installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build Windows installer
+        run: npm run dist:win
+
+      - name: Verify installer artifact exists
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path "$env:GITHUB_WORKSPACE\release" -Filter "BOT.IA-Setup-*.exe" -File | Select-Object -First 1
+          if (-not $exe) {
+            throw "Installer Windows não encontrado em release/."
+          }
+          Write-Host "Installer gerado: $($exe.FullName)"
+          $hash = (Get-FileHash -Algorithm SHA256 $exe.FullName).Hash
+          Write-Host "SHA256: $hash"
+          "$hash  $($exe.Name)" | Set-Content -Path "$env:GITHUB_WORKSPACE\BOT.IA-Setup-1.0.3.sha256.txt" -Encoding UTF8
+          Write-Host "Arquivo de hash salvo: $env:GITHUB_WORKSPACE\BOT.IA-Setup-1.0.3.sha256.txt"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BOT.IA-Setup-1.0.3.exe
+          path: release/BOT.IA-Setup-1.0.3.exe
+          if-no-files-found: error
+
+      - name: Upload checksum artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BOT.IA-Setup-1.0.3.sha256.txt
+          path: BOT.IA-Setup-1.0.3.sha256.txt
+          if-no-files-found: error
