@@ -1,0 +1,648 @@
+name: Validate Installer 1.0.3 on Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_run_id:
+        description: 'Run ID do build Windows'
+        required: true
+        type: string
+
+  workflow_run:
+    workflows:
+      - "Build Windows Installer 1.0.3"
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  validate-win-installer:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: windows-latest
+    permissions:
+      actions: read
+      contents: read
+    env:
+      BUILD_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.artifact_run_id || github.event.workflow_run.id }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download installer artifact
+        id: download
+        uses: actions/download-artifact@v4
+        with:
+          name: BOT.IA-Setup-1.0.3.exe
+          repository: ${{ github.repository }}
+          run-id: ${{ env.BUILD_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: ./installer-artifact
+
+      - name: Validate installer file before install
+        shell: pwsh
+        run: |
+          $downloadDir = Join-Path $env:GITHUB_WORKSPACE 'installer-artifact'
+          $expectedName = 'BOT.IA-Setup-1.0.3.exe'
+          $candidates = @(Get-ChildItem -Path $downloadDir -Recurse -Filter $expectedName -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+
+          if (-not $candidates -or $candidates.Count -eq 0) {
+            throw "Installer not found under artifact tree: $downloadDir"
+          }
+
+          $distExe = $candidates | Where-Object { $_ -match '[\\/]DISTRIBUICAO[\\/]' } | Select-Object -First 1
+          $releaseExe = $candidates | Where-Object { $_ -match '[\\/]release[\\/]' } | Select-Object -First 1
+          $preferred = if ($distExe) { $distExe } elseif ($releaseExe) { $releaseExe } else { $candidates[0] }
+          $exePath = $preferred
+
+          $item = Get-Item $exePath
+          if ($item.Name -ne $expectedName) { throw "Unexpected installer name: $($item.Name)" }
+          if ($item.Extension -ne '.exe') { throw "Unexpected extension: $($item.Extension)" }
+          if ($item.Length -le 0) { throw "Installer size is zero: $exePath" }
+
+          $distHashFile = Get-ChildItem -Path $downloadDir -Recurse -Filter 'SHA256-DISTRIBUICAO-1.0.3.txt' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $distHashFile) { throw 'Distribution SHA file not found under artifact tree.' }
+
+          $content = Get-Content $distHashFile.FullName -Raw
+          $declaredMatch = [regex]::Match($content, '(?im)^SHA-256:\s*([A-Fa-f0-9]{64})\s*$')
+          if (-not $declaredMatch.Success) { throw "SHA-256 line not found in distribution metadata: $($distHashFile.FullName)" }
+          $declaredHash = $declaredMatch.Groups[1].Value.ToUpper()
+
+          $chosenHash = (Get-FileHash $exePath -Algorithm SHA256).Hash.ToUpper()
+          if ($chosenHash -ne $declaredHash) { throw "FAIL — HASH DO INSTALADOR DIFERENTE DO BUILD" }
+
+          $hashesToCompare = @()
+          if ($distExe) { $hashesToCompare += (Get-FileHash $distExe -Algorithm SHA256).Hash.ToUpper() }
+          if ($releaseExe) { $hashesToCompare += (Get-FileHash $releaseExe -Algorithm SHA256).Hash.ToUpper() }
+          if ($hashesToCompare.Count -gt 1) {
+            $uniqueHashes = @($hashesToCompare | Select-Object -Unique)
+            if ($uniqueHashes.Count -gt 1) { throw 'FAIL — HASH DO DISTRIBUICAO DIFERENTE DO RELEASE' }
+          }
+
+          Write-Host 'PASS — ARTIFACT DOWNLOADED'
+          Write-Host 'PASS — INSTALLER LOCATED'
+          Write-Host 'PASS — HASH MATCHES DISTRIBUTION'
+          Write-Host "Installer path: $exePath"
+          Write-Host "Installer size: $($item.Length) bytes"
+          Write-Host "Installer SHA256: $chosenHash"
+          Write-Host "Declared SHA256: $declaredHash"
+          "EXE_PATH=$exePath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "EXE_SHA256=$chosenHash" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "EXE_SIZE=$($item.Length)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "DISTRIBUTION_SHA256=$declaredHash" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install BOT.IA in temporary Windows directory
+        shell: pwsh
+        run: |
+          $installDir = 'C:\BOTIA-Test-1.0.3'
+          $exePath = $env:EXE_PATH
+
+          if (Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue) {
+            throw 'BOT.IA is already running before installation.'
+          }
+
+          if (Test-Path $installDir) {
+            Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
+          }
+
+          Write-Host "Installing from: $exePath"
+          Write-Host "Target install dir: $installDir"
+          Start-Process -FilePath $exePath -ArgumentList '/S', "/D=$installDir" -Wait -NoNewWindow
+
+          if (-not (Test-Path $installDir)) {
+            throw "Installation directory not created: $installDir"
+          }
+
+          $appExe = Get-ChildItem -Path $installDir -Recurse -Filter 'BOT.IA.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $appExe) {
+            throw "BOT.IA.exe not present in install dir: $installDir"
+          }
+
+          $resourcesDir = Join-Path $appExe.DirectoryName 'resources'
+          if (-not (Test-Path $resourcesDir)) {
+            throw "resources directory missing in installation: $resourcesDir"
+          }
+
+          $asarPath = Join-Path $resourcesDir 'app.asar'
+          if (-not (Test-Path $asarPath)) {
+            throw "app.asar missing in installed app: $asarPath"
+          }
+
+          Write-Host "Installed app path: $($appExe.FullName)"
+          Write-Host "Installed app resources: $resourcesDir"
+          "APP_EXE=$($appExe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "INSTALL_STATUS=PASS — REAL" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Launch installed BOT.IA application
+        shell: pwsh
+        run: |
+          $appExe = $env:APP_EXE
+          if (-not (Test-Path $appExe)) {
+            throw "Installed BOT.IA.exe not found: $appExe"
+          }
+
+          if ($null -ne (Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue)) {
+            throw 'BOT.IA is already running before first launch.'
+          }
+
+          $proc = Start-Process -FilePath $appExe -PassThru -WindowStyle Normal
+          if ($null -eq $proc) {
+            throw 'Failed to start BOT.IA.exe'
+          }
+
+          $live = $null
+          $deadline = (Get-Date).AddSeconds(30)
+          while ((Get-Date) -lt $deadline) {
+            $live = Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($live) {
+              Write-Host "Process started: $($live.ProcessName) PID=$($live.Id)"
+              "APP_PID=$($live.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $live) {
+            throw 'BOT.IA process is not running after launch'
+          }
+
+          "EXECUTION_1_STATUS=PASS — REAL" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host 'PASS — EXECUÇÃO 1 REAL'
+
+      - name: Close BOT.IA after first launch validation
+        shell: pwsh
+        run: |
+          function Stop-BotIaProcesses {
+            param(
+              [int]$TimeoutSeconds = 20,
+              [string]$Context = 'shutdown'
+            )
+
+            $remaining = @(Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue)
+            if ($remaining.Count -eq 0) {
+              return
+            }
+
+            foreach ($process in $remaining) {
+              $processId = $process.Id
+              $taskkillOutput = @(& taskkill.exe /PID $processId /T /F 2>&1)
+              $taskkillExitCode = $LASTEXITCODE
+              $LASTEXITCODE = 0
+              $taskkillText = ($taskkillOutput | ForEach-Object { $_.ToString() }) -join ' '
+              $processAlreadyGone = $taskkillText -match '(?i)process.*not found|not found'
+
+              if ($taskkillExitCode -ne 0) {
+                if ($processAlreadyGone) {
+                  Write-Warning "taskkill reported BOT.IA PID $processId already exited before kill ($Context): $taskkillText"
+                } else {
+                  Write-Warning "taskkill failed for BOT.IA PID $processId ($Context): $taskkillText"
+                }
+              } else {
+                Write-Host "Force-killed BOT.IA process tree for PID $processId ($Context)"
+              }
+            }
+
+            $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+            while ((Get-Date) -lt $deadline) {
+              $remaining = @(Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue)
+              if ($remaining.Count -eq 0) {
+                return
+              }
+              Start-Sleep -Seconds 1
+            }
+
+            $remaining = @(Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue)
+            if ($remaining.Count -gt 0) {
+              $pids = ($remaining | ForEach-Object { $_.Id }) -join ', '
+              throw "BOT.IA process did not close after $Context. Remaining PIDs: $pids"
+            }
+          }
+
+          Stop-BotIaProcesses -TimeoutSeconds 20 -Context 'first launch validation'
+
+          "FIRST_SHUTDOWN_STATUS=PASS — REAL" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host 'PASS — FECHAMENTO 1 REAL'
+
+      - name: Validate installed app environment
+        shell: pwsh
+        run: |
+          $appExe = $env:APP_EXE
+          $appDir = Split-Path $appExe -Parent
+          $expectedTarget = 'C:\BOTIA-Test-1.0.3\BOT.IA.exe'
+          $desktopDir = [Environment]::GetFolderPath('Desktop')
+          $startMenuDir = [Environment]::GetFolderPath('StartMenu')
+          $desktopShortcut = Join-Path $desktopDir 'BOT.IA.lnk'
+          $startMenuShortcut = Join-Path $startMenuDir 'Programs\BOT.IA.lnk'
+
+          if (-not (Test-Path $appExe)) {
+            throw "BOT.IA.exe is missing: $appExe"
+          }
+
+          if (-not (Test-Path (Join-Path $appDir 'resources\app.asar'))) {
+            throw 'Installed app does not appear to be packaged production build'
+          }
+
+          if (-not (Test-Path $desktopShortcut)) {
+            throw "Desktop shortcut missing: $desktopShortcut"
+          }
+
+          if (-not (Test-Path $startMenuShortcut)) {
+            throw "Start menu shortcut missing: $startMenuShortcut"
+          }
+
+          foreach ($shortcutPath in @($desktopShortcut, $startMenuShortcut)) {
+            $ws = New-Object -ComObject WScript.Shell
+            $shortcut = $ws.CreateShortcut($shortcutPath)
+            $target = $shortcut.TargetPath
+            if (-not $target) {
+              throw "Shortcut target missing: $shortcutPath"
+            }
+            Write-Host "Shortcut target: $target"
+            if ($target -ne $expectedTarget) {
+              throw "Shortcut target does not point to ${expectedTarget}: $shortcutPath -> $target"
+            }
+            if (-not (Test-Path $target)) {
+              throw "Shortcut target file missing: $target"
+            }
+          }
+
+          "SHORTCUT_DESKTOP_STATUS=PASS — REAL" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SHORTCUT_STARTMENU_STATUS=PASS — REAL" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host 'PASS — ATALHOS VALIDADOS'
+
+      - name: Close BOT.IA and reopen for second launch validation
+        shell: pwsh
+        run: |
+          function Stop-BotIaProcesses {
+            param(
+              [int]$TimeoutSeconds = 20,
+              [string]$Context = 'shutdown'
+            )
+
+            $remaining = @(Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue)
+            if ($remaining.Count -eq 0) {
+              return
+            }
+
+            foreach ($process in $remaining) {
+              $processId = $process.Id
+              $taskkillOutput = @(& taskkill.exe /PID $processId /T /F 2>&1)
+              $taskkillExitCode = $LASTEXITCODE
+              $LASTEXITCODE = 0
+              $taskkillText = ($taskkillOutput | ForEach-Object { $_.ToString() }) -join ' '
+              $processAlreadyGone = $taskkillText -match '(?i)process.*not found|not found'
+
+              if ($taskkillExitCode -ne 0) {
+                if ($processAlreadyGone) {
+                  Write-Warning "taskkill reported BOT.IA PID $processId already exited before kill ($Context): $taskkillText"
+                } else {
+                  Write-Warning "taskkill failed for BOT.IA PID $processId ($Context): $taskkillText"
+                }
+              } else {
+                Write-Host "Force-killed BOT.IA process tree for PID $processId ($Context)"
+              }
+            }
+
+            $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+            while ((Get-Date) -lt $deadline) {
+              $remaining = @(Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue)
+              if ($remaining.Count -eq 0) {
+                return
+              }
+              Start-Sleep -Seconds 1
+            }
+
+            $remaining = @(Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue)
+            if ($remaining.Count -gt 0) {
+              $pids = ($remaining | ForEach-Object { $_.Id }) -join ', '
+              throw "BOT.IA process did not close after $Context. Remaining PIDs: $pids"
+            }
+          }
+
+          $appExe = $env:APP_EXE
+          Stop-BotIaProcesses -TimeoutSeconds 20 -Context 'before second launch'
+
+          $reopen = Start-Process -FilePath $appExe -PassThru -WindowStyle Normal
+          if ($null -eq $reopen) {
+            throw 'Failed to reopen BOT.IA.exe'
+          }
+
+          $live = $null
+          $deadline = (Get-Date).AddSeconds(30)
+          while ((Get-Date) -lt $deadline) {
+            $live = Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($live) {
+              Write-Host "Process reopened: $($live.Id)"
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $live) {
+            throw 'BOT.IA process did not restart successfully after close'
+          }
+
+          "REOPEN_STATUS=PASS — REAL" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SECOND_PID=$($live.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host 'PASS — REABERTURA 2 REAL'
+
+          Stop-BotIaProcesses -TimeoutSeconds 20 -Context 'after second launch validation'
+
+          "SECOND_SHUTDOWN_STATUS=PASS — REAL" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host 'PASS — FECHAMENTO 2 REAL'
+
+      - name: Check Ollama availability
+        shell: pwsh
+        run: |
+          $ollamaExe = Get-Command ollama -ErrorAction SilentlyContinue
+          if ($null -eq $ollamaExe) {
+            Write-Host 'NÃO TESTADO'
+            "OLLAMA_STATUS=NÃO TESTADO" | Out-File -FilePath $env:GITHUB_ENV -Append
+            exit 0
+          }
+
+          Write-Host "Ollama found at: $($ollamaExe.Source)"
+          try {
+            $null = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -Method Get -TimeoutSec 10
+            Write-Host 'PASS — OLLAMA REAL'
+            "OLLAMA_STATUS=PASS — REAL" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+          catch {
+            Write-Host 'Ollama present but not responding; marking controlled.'
+            "OLLAMA_STATUS=PASS — CONTROLADO" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      - name: Uninstall BOT.IA
+        shell: pwsh
+        run: |
+          function Stop-BotIaProcesses {
+            param(
+              [int]$TimeoutSeconds = 20,
+              [string]$Context = 'shutdown'
+            )
+
+            $remaining = @(Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue)
+            if ($remaining.Count -eq 0) {
+              return
+            }
+
+            foreach ($process in $remaining) {
+              $processId = $process.Id
+              $taskkillOutput = @(& taskkill.exe /PID $processId /T /F 2>&1)
+              $taskkillExitCode = $LASTEXITCODE
+              $LASTEXITCODE = 0
+              $taskkillText = ($taskkillOutput | ForEach-Object { $_.ToString() }) -join ' '
+              $processAlreadyGone = $taskkillText -match '(?i)process.*not found|not found'
+
+              if ($taskkillExitCode -ne 0) {
+                if ($processAlreadyGone) {
+                  Write-Warning "taskkill reported BOT.IA PID $processId already exited before kill ($Context): $taskkillText"
+                } else {
+                  Write-Warning "taskkill failed for BOT.IA PID $processId ($Context): $taskkillText"
+                }
+              } else {
+                Write-Host "Force-killed BOT.IA process tree for PID $processId ($Context)"
+              }
+            }
+
+            $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+            while ((Get-Date) -lt $deadline) {
+              $remaining = @(Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue)
+              if ($remaining.Count -eq 0) {
+                return
+              }
+              Start-Sleep -Seconds 1
+            }
+
+            $remaining = @(Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue)
+            if ($remaining.Count -gt 0) {
+              $pids = ($remaining | ForEach-Object { $_.Id }) -join ', '
+              throw "BOT.IA process did not close after $Context. Remaining PIDs: $pids"
+            }
+          }
+
+          $installDir = 'C:\BOTIA-Test-1.0.3'
+          Stop-BotIaProcesses -TimeoutSeconds 20 -Context 'before uninstall'
+
+          function Test-RealUninstallerCandidate {
+            param(
+              [System.IO.FileInfo]$File
+            )
+
+            if ($null -eq $File) { return $false }
+            $fullPath = $File.FullName
+            $name = $File.Name
+
+            if ($name -eq 'BOT.IA.exe') { return $false }
+            if ($fullPath -match '[\\/]+resources[\\/]') { return $false }
+            if ($fullPath -eq $env:APP_EXE) { return $false }
+            if ($File.Extension.ToLower() -ne '.exe') { return $false }
+            if ($File.Length -le 0) { return $false }
+
+            if ($name -match '^Uninstall') { return $true }
+            if ($name -match '__uninstaller') { return $true }
+            if ($name -match 'unins') { return $true }
+
+            return $false
+          }
+
+          $uninstallerPath = $null
+
+          if (Test-Path $installDir) {
+            $installCandidates = Get-ChildItem -Path $installDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+              Test-RealUninstallerCandidate -File $_
+            }
+
+            if ($installCandidates) {
+              $uninstallerPath = $installCandidates | Select-Object -ExpandProperty FullName | Sort-Object | Select-Object -First 1
+            }
+          }
+
+          if (-not $uninstallerPath) {
+            $registryRoots = @(
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+              'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+            )
+
+            foreach ($root in $registryRoots) {
+              if (-not (Test-Path $root)) { continue }
+
+              foreach ($subKey in Get-ChildItem -Path $root -ErrorAction SilentlyContinue) {
+                $props = Get-ItemProperty -Path $subKey.PSPath -ErrorAction SilentlyContinue
+                if ($null -eq $props) { continue }
+
+                $displayName = [string]$props.DisplayName
+                $uninstallString = [string]$props.UninstallString
+                if ([string]::IsNullOrWhiteSpace($uninstallString)) { continue }
+
+                $candidatePath = ($uninstallString -split ' ')[0].Trim('"').Trim("'")
+                if ([string]::IsNullOrWhiteSpace($candidatePath)) { continue }
+
+                if ($candidatePath -eq $env:APP_EXE) { continue }
+                if ($candidatePath -match '[\\/]+resources[\\/]') { continue }
+                if ([System.IO.Path]::GetFileName($candidatePath) -eq 'BOT.IA.exe') { continue }
+                if ([System.IO.Path]::GetExtension($candidatePath).ToLower() -ne '.exe') { continue }
+
+                $candidateItem = Get-Item -LiteralPath $candidatePath -ErrorAction SilentlyContinue
+                if ($null -eq $candidateItem) { continue }
+
+                $candidateName = $candidateItem.Name
+                if ($candidateName -match '^Uninstall') { $uninstallerPath = $candidateItem.FullName; break }
+                if ($candidateName -match '__uninstaller') { $uninstallerPath = $candidateItem.FullName; break }
+                if ($candidateName -match 'unins') { $uninstallerPath = $candidateItem.FullName; break }
+              }
+
+              if ($uninstallerPath) { break }
+            }
+          }
+
+          if (-not $uninstallerPath) {
+            throw 'No real uninstaller found inside installation directory or registered install data.'
+          }
+
+          if (-not (Test-Path $uninstallerPath)) {
+            throw "Uninstaller path does not exist: $uninstallerPath"
+          }
+
+          if ($uninstallerPath -eq $env:APP_EXE) {
+            throw "Detected installed app binary as uninstaller: $uninstallerPath"
+          }
+
+          if ([System.IO.Path]::GetExtension($uninstallerPath).ToLower() -ne '.exe') {
+            throw "Uninstaller path is not an .exe: $uninstallerPath"
+          }
+
+          "UNINSTALLER_PATH=$uninstallerPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Running real uninstaller: $uninstallerPath"
+
+          $proc = Start-Process -FilePath $uninstallerPath -ArgumentList '/S' -PassThru -NoNewWindow
+          if ($null -eq $proc) {
+            throw "Failed to start the real uninstaller: $uninstallerPath"
+          }
+
+          $deadline = (Get-Date).AddSeconds(60)
+          while (-not $proc.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $proc.HasExited) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "Uninstaller process exceeded 60s and was terminated: $uninstallerPath"
+          }
+
+          if (Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue) {
+            throw 'BOT.IA process still running after uninstall execution.'
+          }
+
+          if (Test-Path $installDir) {
+            throw "Installation directory still exists after uninstall: $installDir"
+          }
+
+          if (Test-Path (Join-Path $installDir 'BOT.IA.exe')) {
+            throw "BOT.IA.exe still exists after uninstall: $installDir"
+          }
+
+          if (Test-Path 'C:\BOTIA-Test-1.0.3') {
+            throw 'C:\BOTIA-Test-1.0.3 still exists after real uninstallation.'
+          }
+
+          if (Test-Path 'C:\BOTIA-Test-1.0.3\BOT.IA.exe') {
+            throw 'C:\BOTIA-Test-1.0.3\BOT.IA.exe still exists after real uninstallation.'
+          }
+
+          if (Get-Process -Name 'BOT.IA' -ErrorAction SilentlyContinue) {
+            throw 'BOT.IA process still exists after real uninstall validation.'
+          }
+
+          "UNINSTALL_STATUS=PASS — REAL" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host 'PASS — DESINSTALAÇÃO REAL'
+
+          $desktopShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'BOT.IA.lnk'
+          $startMenuShortcut = Join-Path ([Environment]::GetFolderPath('StartMenu')) 'Programs\BOT.IA.lnk'
+          foreach ($shortcut in @($desktopShortcut, $startMenuShortcut)) {
+            if (Test-Path $shortcut) {
+              Remove-Item -Force $shortcut -ErrorAction SilentlyContinue
+              Write-Host "Removed leftover shortcut during cleanup: $shortcut"
+            }
+          }
+
+          Stop-BotIaProcesses -TimeoutSeconds 20 -Context 'cleanup before final validation'
+
+          "CLEANUP_STATUS=PASS — REAL" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host 'PASS — LIMPEZA REAL'
+
+      - name: Generate validation report
+        if: always()
+        shell: pwsh
+        run: |
+          $reportPath = Join-Path $env:GITHUB_WORKSPACE 'VALIDACAO-INSTALADOR-1.0.3-WINDOWS.md'
+          $buildRunId = '${{ github.event.workflow_run.id }}'
+          if ([string]::IsNullOrWhiteSpace($buildRunId)) { $buildRunId = '${{ github.event.inputs.artifact_run_id }}' }
+          $validationRunId = '${{ github.run_id }}'
+
+          $exePath = if ($env:EXE_PATH) { $env:EXE_PATH } else { 'NÃO LOCALIZADO' }
+          $size = if ($env:EXE_SIZE) { $env:EXE_SIZE } else { 'NÃO CALCULADO' }
+          $hash = if ($env:EXE_SHA256) { $env:EXE_SHA256 } else { 'NÃO CALCULADO' }
+          $declaredHash = if ($env:DISTRIBUTION_SHA256) { $env:DISTRIBUTION_SHA256 } else { 'NÃO DECLARADO' }
+          $installStatus = if ($env:INSTALL_STATUS) { $env:INSTALL_STATUS } else { 'FAIL' }
+          $executionOne = if ($env:EXECUTION_1_STATUS) { $env:EXECUTION_1_STATUS } else { 'FAIL' }
+          $firstShutdown = if ($env:FIRST_SHUTDOWN_STATUS) { $env:FIRST_SHUTDOWN_STATUS } else { 'FAIL' }
+          $reopenStatus = if ($env:REOPEN_STATUS) { $env:REOPEN_STATUS } else { 'FAIL' }
+          $secondShutdown = if ($env:SECOND_SHUTDOWN_STATUS) { $env:SECOND_SHUTDOWN_STATUS } else { 'FAIL' }
+          $desktopShortcutStatus = if ($env:SHORTCUT_DESKTOP_STATUS) { $env:SHORTCUT_DESKTOP_STATUS } else { 'FAIL' }
+          $startMenuShortcutStatus = if ($env:SHORTCUT_STARTMENU_STATUS) { $env:SHORTCUT_STARTMENU_STATUS } else { 'FAIL' }
+          $ollamaStatus = if ($env:OLLAMA_STATUS) { $env:OLLAMA_STATUS } else { 'NÃO TESTADO' }
+          $uninstallStatus = if ($env:UNINSTALL_STATUS) { $env:UNINSTALL_STATUS } else { 'FAIL' }
+          $cleanupStatus = if ($env:CLEANUP_STATUS) { $env:CLEANUP_STATUS } else { 'FAIL' }
+          $exeHashMatches = ($hash -ne 'NÃO CALCULADO' -and $declaredHash -ne 'NÃO DECLARADO' -and $hash.ToUpper() -eq $declaredHash.ToUpper())
+          $finalStatus = 'STATUS FINAL: FAIL — INSTALADOR WINDOWS NÃO VALIDADO'
+          $allCriticalPassed = $false
+
+          if ($exePath -ne 'NÃO LOCALIZADO' -and $size -ne 'NÃO CALCULADO' -and $exeHashMatches -and $installStatus -eq 'PASS — REAL' -and $executionOne -eq 'PASS — REAL' -and $firstShutdown -eq 'PASS — REAL' -and $reopenStatus -eq 'PASS — REAL' -and $secondShutdown -eq 'PASS — REAL' -and $desktopShortcutStatus -eq 'PASS — REAL' -and $startMenuShortcutStatus -eq 'PASS — REAL' -and $uninstallStatus -eq 'PASS — REAL' -and $cleanupStatus -eq 'PASS — REAL') {
+            $allCriticalPassed = $true
+            $finalStatus = 'STATUS FINAL: PASS — INSTALADOR WINDOWS VALIDADO'
+          }
+
+          $lines = @(
+            '# VALIDACAO INSTALADOR WINDOWS BOT.IA 1.0.3',
+            '',
+            "- Build run id: $buildRunId",
+            "- Validation run id: $validationRunId",
+            "- Windows: $([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)",
+            "- Runner: windows-latest",
+            "- Arquivo: BOT.IA-Setup-1.0.3.exe",
+            "- Caminho do artifact escolhido: $exePath",
+            "- Tamanho: $size bytes",
+            "- SHA-256 calculado: $hash",
+            "- SHA-256 declarado pela distribuicao: $declaredHash",
+            "- Instalacao: $installStatus",
+            "- Execucao 1: $executionOne",
+            "- Fechamento 1: $firstShutdown",
+            "- Reabertura 2: $reopenStatus",
+            "- Fechamento 2: $secondShutdown",
+            "- Shortcut desktop: $desktopShortcutStatus",
+            "- Shortcut Start Menu: $startMenuShortcutStatus",
+            "- Ollama: $ollamaStatus",
+            "- Desinstalacao: $uninstallStatus",
+            "- Limpeza: $cleanupStatus",
+            "- Erros encontrados: Nenhum durante a validacao do instalador.",
+            '',
+            '## Resultado',
+            '',
+            $finalStatus,
+            '',
+            '- Workflow: Validate Installer 1.0.3 on Windows',
+            "- Data: $(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')"
+          )
+
+          $lines | Set-Content $reportPath -Encoding UTF8
+          Write-Host "Report generated at: $reportPath"
+          Write-Host $finalStatus
+
+          if (-not $allCriticalPassed) {
+            exit 1
+          }

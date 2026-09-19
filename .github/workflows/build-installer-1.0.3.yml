@@ -1,0 +1,165 @@
+name: Build Windows Installer 1.0.3
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-win-installer:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: npm ci
+
+      - name: Set package version to 1.0.3 for Windows build
+        shell: pwsh
+        run: |
+          $packageJsonPath = Join-Path $env:GITHUB_WORKSPACE 'package.json'
+          $packageJson = Get-Content $packageJsonPath -Raw | ConvertFrom-Json
+          $packageJson.version = '1.0.3'
+          $packageJson | ConvertTo-Json -Depth 100 | Set-Content $packageJsonPath -Encoding UTF8
+          Write-Host 'package.json version set to 1.0.3'
+          Get-Content $packageJsonPath | Select-Object -First 20
+
+      - name: Verify version change
+        shell: pwsh
+        run: |
+          $packageJson = Get-Content package.json -Raw | ConvertFrom-Json
+          if ($packageJson.version -ne '1.0.3') {
+            throw 'Version mismatch: expected 1.0.3'
+          }
+          Write-Host "Version confirmed: $($packageJson.version)"
+
+      - name: Verify build configuration
+        shell: pwsh
+        run: |
+          $packageJson = Get-Content package.json -Raw | ConvertFrom-Json
+
+          if ($packageJson.scripts.build -ne 'vite build') {
+            throw 'build script missing or changed unexpectedly'
+          }
+
+          if ($packageJson.scripts.'dist:win' -ne 'npm run build && electron-builder --win nsis') {
+            throw "dist:win script mismatch: [$($packageJson.scripts.'dist:win')]"
+          }
+
+          if ($packageJson.build.artifactName -ne 'BOT.IA-Setup-${version}.${ext}') {
+            throw 'artifactName not set for installer naming'
+          }
+
+          if ($null -eq $packageJson.build.nsis) {
+            throw 'NSIS target missing from electron-builder config'
+          }
+
+          Write-Host 'Build config verified: Vite build + electron-builder NSIS target present.'
+
+      - name: Build application
+        shell: pwsh
+        run: npm run build
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: npx electron-builder --win nsis --publish never
+
+      - name: Verify installer was generated
+        shell: pwsh
+        run: |
+          $exePath = Join-Path $env:GITHUB_WORKSPACE 'release/BOT.IA-Setup-1.0.3.exe'
+          if (-not (Test-Path $exePath)) {
+            throw "Installer missing: $exePath"
+          }
+
+          $item = Get-Item $exePath
+          if ($item.Extension -ne '.exe') {
+            throw "Unexpected extension for installer: $($item.Extension)"
+          }
+
+          if ($item.Name -ne 'BOT.IA-Setup-1.0.3.exe') {
+            throw "Unexpected installer name: $($item.Name)"
+          }
+
+          if ($item.Length -le 0) {
+            throw "Installer is empty: $exePath"
+          }
+
+          $hash = (Get-FileHash $exePath -Algorithm SHA256).Hash
+          if ([string]::IsNullOrWhiteSpace($hash)) {
+            throw "SHA-256 could not be computed for installer: $exePath"
+          }
+
+          Write-Host "PASS — BUILD WINDOWS REAL"
+          Write-Host "Version: 1.0.3"
+          Write-Host "Name: $($item.Name)"
+          Write-Host "Path: $exePath"
+          Write-Host "Size: $($item.Length) bytes"
+          Write-Host "SHA-256: $hash"
+          "EXE_PATH=$exePath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "EXE_SIZE=$($item.Length)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "EXE_SHA256=$hash" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Prepare distribution metadata
+        shell: pwsh
+        run: |
+          $distDir = Join-Path $env:GITHUB_WORKSPACE 'DISTRIBUICAO'
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+
+          $sourceExe = Join-Path $env:GITHUB_WORKSPACE 'release/BOT.IA-Setup-1.0.3.exe'
+          $destExe = Join-Path $distDir 'BOT.IA-Setup-1.0.3.exe'
+          Copy-Item $sourceExe $destExe -Force
+
+          $releaseHash = $env:EXE_SHA256
+          $distHash = (Get-FileHash $destExe -Algorithm SHA256).Hash
+          $distSize = (Get-Item $destExe).Length
+          $timestamp = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+          if ($distHash -ne $releaseHash) {
+            throw "FAIL — HASH DA DISTRIBUIÇÃO NÃO CORRESPONDE AO BUILD"
+          }
+
+          $shaContent = @(
+            'Arquivo: BOT.IA-Setup-1.0.3.exe',
+            'Versao: 1.0.3',
+            "Tamanho em bytes: $distSize",
+            "SHA-256: $distHash",
+            "Gerado em: $timestamp UTC"
+          )
+          $shaContent | Set-Content (Join-Path $distDir 'SHA256-DISTRIBUICAO-1.0.3.txt') -Encoding UTF8
+
+          $certText = @(
+            '# CERTIFICACAO BOT.IA 1.0.3',
+            '',
+            '- Versao: 1.0.3',
+            '- Arquivo: BOT.IA-Setup-1.0.3.exe',
+            "- Tamanho em bytes: $distSize",
+            "- SHA-256: $distHash",
+            "- Gerado em: $timestamp UTC",
+            '- Status: BUILD WINDOWS REAL',
+            '- Observacao: o arquivo .EXE foi gerado no runner Windows do GitHub Actions; o SHA-256 foi calculado e o pacote foi copiado para DISTRIBUICAO para integridade. A instalacao final ainda precisa ser validada no Windows de destino.'
+          )
+          $certText | Set-Content (Join-Path $distDir 'CERTIFICACAO-1.0.3.md') -Encoding UTF8
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BOT.IA-Setup-1.0.3.exe
+          path: |
+            release/BOT.IA-Setup-1.0.3.exe
+            DISTRIBUICAO/BOT.IA-Setup-1.0.3.exe
+            DISTRIBUICAO/SHA256-DISTRIBUICAO-1.0.3.txt
+            DISTRIBUICAO/CERTIFICACAO-1.0.3.md
+          if-no-files-found: error
